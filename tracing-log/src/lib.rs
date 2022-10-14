@@ -127,7 +127,17 @@
 )]
 use once_cell::sync::Lazy;
 
-use std::{fmt, io};
+use std::{
+    collections::{
+        hash_map::{Entry, HashMap},
+        HashSet,
+    },
+    fmt, io, ptr,
+    sync::{
+        atomic::{AtomicPtr, Ordering},
+        Mutex,
+    },
+};
 
 use tracing_core::{
     callsite::{self, Callsite},
@@ -169,7 +179,7 @@ pub(crate) fn dispatch_record(record: &log::Record<'_>) {
             return;
         }
 
-        let (_, keys, meta) = loglevel_to_cs(record.level());
+        let (_, keys, meta) = get_callsite(record);
 
         let log_module = record.module_path();
         let log_file = record.file();
@@ -272,6 +282,116 @@ impl Fields {
             line,
         }
     }
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Hash)]
+struct CallsiteKey {
+    level: Level,
+    file: Option<&'static str>,
+    line: Option<u32>,
+}
+
+#[derive(Copy, Clone)]
+struct CallsiteVal {
+    callsite: &'static dyn Callsite,
+    meta: &'static Metadata<'static>,
+}
+
+struct LeakCallsite(AtomicPtr<&'static Metadata<'static>>);
+
+impl callsite::Callsite for LeakCallsite {
+    fn set_interest(&self, _: collect::Interest) {}
+    fn metadata(&self) -> &'static Metadata<'static> {
+        // SAFETY: this is always initialized during construction
+        unsafe { *self.0.load(Ordering::Relaxed) }
+    }
+}
+
+struct CallsiteState {
+    callsites: HashMap<CallsiteKey, CallsiteVal>,
+    filememo: HashSet<&'static str>,
+}
+
+impl CallsiteState {
+    fn new() -> Self {
+        Self {
+            callsites: HashMap::new(),
+            filememo: HashSet::new(),
+        }
+    }
+
+    fn filememo(&mut self, file: &str) -> &'static str {
+        if let Some(file) = self.filememo.get(file) {
+            *file
+        } else {
+            let file: &'static str = &*Box::leak(file.to_string().into_boxed_str());
+            self.filememo.insert(file);
+            file
+        }
+    }
+
+    fn callsite(
+        &mut self,
+        key: CallsiteKey,
+    ) -> (&'static dyn Callsite, &'static Metadata<'static>) {
+        let CallsiteVal { callsite, meta } = match self.callsites.entry(key) {
+            Entry::Vacant(vac) => {
+                let callsite = Box::leak(Box::new(LeakCallsite(AtomicPtr::new(ptr::null_mut()))));
+                let meta = Metadata::new(
+                    "log event",
+                    "log",
+                    key.level,
+                    key.file,
+                    key.line,
+                    None,
+                    field::FieldSet::new(FIELD_NAMES, identify_callsite!(&*callsite)),
+                    Kind::EVENT,
+                );
+                let meta = Box::leak(Box::new(meta));
+
+                // We need to play pointer games to set up the cyclic reference
+                // between callsite and meta.fields.
+                callsite
+                    .0
+                    .store(&&*meta as *const _ as *mut _, Ordering::Relaxed);
+
+                *vac.insert(CallsiteVal { callsite, meta })
+            }
+            Entry::Occupied(occ) => *occ.get(),
+        };
+        (callsite, meta)
+    }
+}
+
+static CALLSITES: Lazy<Mutex<CallsiteState>> = Lazy::new(|| Mutex::new(CallsiteState::new()));
+
+/// Construct a static callsite with leaked heap allocations
+fn get_callsite(
+    record: &log::Record<'_>,
+) -> (
+    &'static dyn Callsite,
+    &'static Fields,
+    &'static Metadata<'static>,
+) {
+    let (level, fields) = match record.level() {
+        log::Level::Trace => (Level::TRACE, &*TRACE_FIELDS),
+        log::Level::Debug => (Level::DEBUG, &*DEBUG_FIELDS),
+        log::Level::Info => (Level::INFO, &*INFO_FIELDS),
+        log::Level::Warn => (Level::WARN, &*WARN_FIELDS),
+        log::Level::Error => (Level::ERROR, &*ERROR_FIELDS),
+    };
+
+    let mut state = CALLSITES.lock().unwrap();
+    let file = record.file().map(|file| state.filememo(file));
+
+    let key = CallsiteKey {
+        level,
+        file,
+        line: record.line(),
+    };
+
+    let (cs, meta) = state.callsite(key);
+    (cs, fields, meta)
 }
 
 macro_rules! log_cs {
